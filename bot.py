@@ -23,6 +23,12 @@ DB_PATH = os.environ.get("DB_PATH", "moderator.db")
 WARN_LIMIT = int(os.environ.get("DEFAULT_WARN_LIMIT", "10"))
 
 
+def msg_name(msg):
+    if msg.author and msg.author.nickname:
+        return msg.author.nickname
+    return msg.user_id
+
+
 async def reply(bot, msg, text):
     try:
         await bot.send_message(msg.chat_id, text, reply_to=msg.message_id)
@@ -30,17 +36,24 @@ async def reply(bot, msg, text):
         log.warning("не смог ответить: %s", e)
 
 
-async def cmd_warn(bot, bot_id, msg, storage, args):
+async def get_reply_target(bot, msg):
     if not msg.reply_message_id:
-        await reply(bot, msg, "Команда /warn должна быть ответом на сообщение нарушителя.")
-        return
+        return None
     try:
         target = await bot.get_message(msg.chat_id, msg.reply_message_id)
     except KarboError as e:
         log.warning("не достал реплай: %s", e)
+        return None
+    name = target.author.nickname if target.author else target.user_id
+    return target.user_id, name
+
+
+async def cmd_warn(bot, bot_id, msg, storage, args):
+    t = await get_reply_target(bot, msg)
+    if not t:
+        await reply(bot, msg, "Команда /warn должна быть ответом на сообщение нарушителя.")
         return
-    target_id = target.user_id
-    target_name = target.author.nickname if target.author else target_id
+    target_id, target_name = t
 
     if target_id == bot_id:
         await reply(bot, msg, "Себя предупредить я не дам.")
@@ -56,7 +69,6 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
         await reply(bot, msg, text)
         return
 
-    # лимит - кикаем
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
@@ -65,6 +77,62 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
         await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
     except KarboError as e:
         await reply(bot, msg, f"Ошибка кика: {e}")
+
+
+async def cmd_kick(bot, bot_id, msg, storage, args):
+    # тоже самое почти как warn только без счётчика
+    t = await get_reply_target(bot, msg)
+    if not t:
+        await reply(bot, msg, "Команда /kick должна быть ответом на сообщение нарушителя.")
+        return
+    target_id, target_name = t
+
+    if target_id == bot_id:
+        await reply(bot, msg, "Меня кикнуть не получится.")
+        return
+
+    reason = " ".join(args).strip()
+    try:
+        await bot.kick_user(msg.chat_id, target_id)
+        await storage.clear_warns(msg.chat_id, target_id)
+        text = f"{target_name} кикнут."
+        if reason:
+            text += " Причина: " + reason
+        await reply(bot, msg, text)
+    except ForbiddenError:
+        await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
+    except KarboError as e:
+        await reply(bot, msg, f"Ошибка кика: {e}")
+
+
+async def cmd_unwarn(bot, bot_id, msg, storage, args):
+    t = await get_reply_target(bot, msg)
+    if not t:
+        await reply(bot, msg, "Команда /unwarn должна быть ответом на сообщение пользователя.")
+        return
+    target_id, target_name = t
+
+    remaining = await storage.remove_last_warn(msg.chat_id, target_id)
+    if remaining < 0:
+        await reply(bot, msg, f"У {target_name} нет активных варнов.")
+        return
+    await reply(bot, msg, f"С {target_name} снят варн. Осталось: {remaining}/{WARN_LIMIT}.")
+
+
+async def cmd_warns(bot, bot_id, msg, storage, args):
+    target_id = None
+    target_name = "Пользователь"
+    if msg.reply_message_id:
+        t = await get_reply_target(bot, msg)
+        if t:
+            target_id, target_name = t
+    if not target_id:
+        # ну ок, показываем свои
+        target_id = msg.user_id
+        target_name = msg_name(msg)
+
+    count = await storage.count_warns(msg.chat_id, target_id)
+    await reply(bot, msg, f"{target_name}: {count}/{WARN_LIMIT} варнов.")
 
 
 async def main():
@@ -93,6 +161,12 @@ async def main():
                 try:
                     if cmd == "warn":
                         await cmd_warn(bot, bot_id, msg, storage, args)
+                    elif cmd == "unwarn":
+                        await cmd_unwarn(bot, bot_id, msg, storage, args)
+                    elif cmd == "kick":
+                        await cmd_kick(bot, bot_id, msg, storage, args)
+                    elif cmd == "warns":
+                        await cmd_warns(bot, bot_id, msg, storage, args)
                 except Exception as e:
                     log.exception("ошибка в команде %s: %s", cmd, e)
 
