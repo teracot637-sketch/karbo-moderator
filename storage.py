@@ -3,8 +3,9 @@ import aiosqlite
 
 # обёртка над sqlite. варны - по строке на варн (так проще снимать последний)
 class Storage:
-    def __init__(self, db_path):
+    def __init__(self, db_path, default_warn_limit=10):
         self.db_path = db_path
+        self.default_limit = default_warn_limit
 
     async def init(self):
         async with aiosqlite.connect(self.db_path) as db:
@@ -21,6 +22,12 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_warns_chat_user ON warns(chat_id, user_id)"
             )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS chat_config (
+                    chat_id    TEXT PRIMARY KEY,
+                    warn_limit INTEGER
+                )
+            """)
             await db.commit()
 
     async def add_warn(self, chat_id, user_id, issuer_id, reason, ts):
@@ -73,3 +80,26 @@ class Storage:
             )
             count = await cur.fetchone()
             return count[0] if count else 0
+
+    # ---- настройки чата ----
+
+    async def get_warn_limit(self, chat_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT warn_limit FROM chat_config WHERE chat_id=?",
+                (chat_id,),
+            )
+            row = await cur.fetchone()
+            if not row or row[0] is None:
+                return self.default_limit
+            return row[0]
+
+    async def set_warn_limit(self, chat_id, limit):
+        # upsert: если есть запись - апдейтим, иначе вставляем
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO chat_config (chat_id, warn_limit) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET warn_limit=excluded.warn_limit",
+                (chat_id, limit),
+            )
+            await db.commit()

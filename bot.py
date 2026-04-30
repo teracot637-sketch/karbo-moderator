@@ -20,13 +20,56 @@ log = logging.getLogger("moderator")
 
 TOKEN = os.environ["KARBO_BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "moderator.db")
-WARN_LIMIT = int(os.environ.get("DEFAULT_WARN_LIMIT", "10"))
+DEFAULT_LIMIT = int(os.environ.get("DEFAULT_WARN_LIMIT", "10"))
+HELPER_MIN = int(os.environ.get("HELPER_ROLE_MIN", "1"))
+ORG_MIN = int(os.environ.get("ORGANIZER_ROLE_MIN", "2"))
+ROLE_TTL = float(os.environ.get("BOT_ROLE_TTL", "300"))
+
+# кэш роли бота на 5 мин, иначе апи задрочим
+# chat_id -> (role, expires_at)
+_role_cache = {}
+
+
+def msg_role(msg):
+    if not msg.author or msg.author.role is None:
+        return 0
+    return msg.author.role
 
 
 def msg_name(msg):
     if msg.author and msg.author.nickname:
         return msg.author.nickname
     return msg.user_id
+
+
+async def fetch_role(bot, chat_id, user_id):
+    # тащим всех мемберов и ищем кого надо. tупо но работает
+    # 200 это максимум на запрос вроде
+    offset = 0
+    try:
+        while True:
+            members = await bot.get_chat_members(chat_id, limit=200, offset=offset)
+            if not members:
+                return 0
+            for m in members:
+                if m.user_id == user_id:
+                    return m.role
+            if len(members) < 200:
+                return 0
+            offset += 200
+    except KarboError as e:
+        log.warning("не достал роль %s/%s: %s", chat_id, user_id, e)
+        return 0
+
+
+async def get_bot_role(bot, bot_id, chat_id):
+    cached = _role_cache.get(chat_id)
+    now = time.time()
+    if cached and cached[1] > now:
+        return cached[0]
+    role = await fetch_role(bot, chat_id, bot_id)
+    _role_cache[chat_id] = (role, now + ROLE_TTL)
+    return role
 
 
 async def reply(bot, msg, text):
@@ -49,6 +92,12 @@ async def get_reply_target(bot, msg):
 
 
 async def cmd_warn(bot, bot_id, msg, storage, args):
+    # бот должен быть помощником и автор тоже
+    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
+        return
+    if msg_role(msg) < HELPER_MIN:
+        return
+
     t = await get_reply_target(bot, msg)
     if not t:
         await reply(bot, msg, "Команда /warn должна быть ответом на сообщение нарушителя.")
@@ -61,9 +110,10 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
 
     reason = " ".join(args).strip()
     count = await storage.add_warn(msg.chat_id, target_id, msg.user_id, reason, int(time.time()))
+    limit = await storage.get_warn_limit(msg.chat_id)
 
-    if count < WARN_LIMIT:
-        text = "%s получил предупреждение %d/%d." % (target_name, count, WARN_LIMIT)
+    if count < limit:
+        text = "%s получил предупреждение %d/%d." % (target_name, count, limit)
         if reason:
             text += " Причина: " + reason
         await reply(bot, msg, text)
@@ -72,7 +122,7 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
-        await reply(bot, msg, f"{target_name} получил {count}/{WARN_LIMIT} варнов и был кикнут.")
+        await reply(bot, msg, f"{target_name} получил {count}/{limit} варнов и был кикнут.")
     except ForbiddenError:
         await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
     except KarboError as e:
@@ -80,7 +130,11 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
 
 
 async def cmd_kick(bot, bot_id, msg, storage, args):
-    # тоже самое почти как warn только без счётчика
+    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
+        return
+    if msg_role(msg) < HELPER_MIN:
+        return
+
     t = await get_reply_target(bot, msg)
     if not t:
         await reply(bot, msg, "Команда /kick должна быть ответом на сообщение нарушителя.")
@@ -106,6 +160,11 @@ async def cmd_kick(bot, bot_id, msg, storage, args):
 
 
 async def cmd_unwarn(bot, bot_id, msg, storage, args):
+    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
+        return
+    if msg_role(msg) < HELPER_MIN:
+        return
+
     t = await get_reply_target(bot, msg)
     if not t:
         await reply(bot, msg, "Команда /unwarn должна быть ответом на сообщение пользователя.")
@@ -116,7 +175,23 @@ async def cmd_unwarn(bot, bot_id, msg, storage, args):
     if remaining < 0:
         await reply(bot, msg, f"У {target_name} нет активных варнов.")
         return
-    await reply(bot, msg, f"С {target_name} снят варн. Осталось: {remaining}/{WARN_LIMIT}.")
+    limit = await storage.get_warn_limit(msg.chat_id)
+    await reply(bot, msg, f"С {target_name} снят варн. Осталось: {remaining}/{limit}.")
+
+
+async def cmd_setwarns(bot, bot_id, msg, storage, args):
+    # только организатор
+    if msg_role(msg) < ORG_MIN:
+        return
+    if not args or not args[0].isdigit():
+        await reply(bot, msg, "Использование: /setwarns <число от 1 до 100>")
+        return
+    n = int(args[0])
+    if n < 1 or n > 100:
+        await reply(bot, msg, "Число должно быть от 1 до 100.")
+        return
+    await storage.set_warn_limit(msg.chat_id, n)
+    await reply(bot, msg, f"Лимит варнов для этого чата: {n}.")
 
 
 async def cmd_warns(bot, bot_id, msg, storage, args):
@@ -127,16 +202,16 @@ async def cmd_warns(bot, bot_id, msg, storage, args):
         if t:
             target_id, target_name = t
     if not target_id:
-        # ну ок, показываем свои
         target_id = msg.user_id
         target_name = msg_name(msg)
 
     count = await storage.count_warns(msg.chat_id, target_id)
-    await reply(bot, msg, f"{target_name}: {count}/{WARN_LIMIT} варнов.")
+    limit = await storage.get_warn_limit(msg.chat_id)
+    await reply(bot, msg, f"{target_name}: {count}/{limit} варнов.")
 
 
 async def main():
-    storage = Storage(DB_PATH)
+    storage = Storage(DB_PATH, DEFAULT_LIMIT)
     await storage.init()
 
     async with KarboBot(TOKEN) as bot:
@@ -165,6 +240,8 @@ async def main():
                         await cmd_unwarn(bot, bot_id, msg, storage, args)
                     elif cmd == "kick":
                         await cmd_kick(bot, bot_id, msg, storage, args)
+                    elif cmd == "setwarns":
+                        await cmd_setwarns(bot, bot_id, msg, storage, args)
                     elif cmd == "warns":
                         await cmd_warns(bot, bot_id, msg, storage, args)
                 except Exception as e:
