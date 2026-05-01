@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from karbo import KarboBot, KarboBotWS, Message
 from karbo.errors import ForbiddenError, KarboError
 
+from nsfw import NSFWDetector
 from storage import Storage
 
 
@@ -21,6 +22,9 @@ log = logging.getLogger("moderator")
 TOKEN = os.environ["KARBO_BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "moderator.db")
 DEFAULT_LIMIT = int(os.environ.get("DEFAULT_WARN_LIMIT", "10"))
+NSFW_ON = os.environ.get("NSFW_ENABLED", "1") == "1"
+NSFW_THR = float(os.environ.get("NSFW_THRESHOLD", "0.6"))
+NSFW_LIMIT = int(os.environ.get("NSFW_WARN_LIMIT", "3"))
 HELPER_MIN = int(os.environ.get("HELPER_ROLE_MIN", "1"))
 ORG_MIN = int(os.environ.get("ORGANIZER_ROLE_MIN", "2"))
 ROLE_TTL = float(os.environ.get("BOT_ROLE_TTL", "300"))
@@ -122,6 +126,7 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
+        await storage.clear_nsfw_warns(msg.chat_id, target_id)
         await reply(bot, msg, f"{target_name} получил {count}/{limit} варнов и был кикнут.")
     except ForbiddenError:
         await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
@@ -149,6 +154,7 @@ async def cmd_kick(bot, bot_id, msg, storage, args):
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
+        await storage.clear_nsfw_warns(msg.chat_id, target_id)
         text = f"{target_name} кикнут."
         if reason:
             text += " Причина: " + reason
@@ -207,12 +213,15 @@ async def cmd_warns(bot, bot_id, msg, storage, args):
 
     count = await storage.count_warns(msg.chat_id, target_id)
     limit = await storage.get_warn_limit(msg.chat_id)
-    await reply(bot, msg, f"{target_name}: {count}/{limit} варнов.")
+    nsfw_count = await storage.count_nsfw_warns(msg.chat_id, target_id)
+    await reply(bot, msg, f"{target_name}: {count}/{limit} варнов, {nsfw_count}/{NSFW_LIMIT} NSFW.")
 
 
 async def main():
     storage = Storage(DB_PATH, DEFAULT_LIMIT)
     await storage.init()
+
+    nsfw = NSFWDetector(threshold=NSFW_THR) if NSFW_ON else None
 
     async with KarboBot(TOKEN) as bot:
         ws = KarboBotWS(TOKEN)
@@ -246,9 +255,48 @@ async def main():
                         await cmd_warns(bot, bot_id, msg, storage, args)
                 except Exception as e:
                     log.exception("ошибка в команде %s: %s", cmd, e)
+                return
+
+            # не команда - картинки на nsfw
+            if nsfw and nsfw.ready and msg.images:
+                asyncio.create_task(handle_nsfw(bot, bot_id, msg, storage, nsfw))
 
         log.info("Подключаюсь к WebSocket...")
         await ws.run_forever()
+
+
+async def handle_nsfw(bot, bot_id, msg, storage, nsfw):
+    if not msg.images:
+        return
+
+    # тут без try падало пару раз когда картинка битая. теперь ловим всё
+    try:
+        explicit = await nsfw.is_explicit(msg.images)
+    except Exception as e:
+        log.warning("ошибка проверки NSFW: %s", e)
+        return
+    if not explicit:
+        return
+
+    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
+        return
+
+    name = msg_name(msg)
+    count = await storage.add_nsfw_warn(msg.chat_id, msg.user_id, int(time.time()))
+
+    if count < NSFW_LIMIT:
+        await reply(bot, msg, f"{name}, 18+ контент запрещён. Предупреждение {count}/{NSFW_LIMIT}.")
+        return
+
+    try:
+        await bot.kick_user(msg.chat_id, msg.user_id)
+        await storage.clear_warns(msg.chat_id, msg.user_id)
+        await storage.clear_nsfw_warns(msg.chat_id, msg.user_id)
+        await reply(bot, msg, f"{name} кикнут за 18+ контент ({count}/{NSFW_LIMIT}).")
+    except ForbiddenError:
+        return
+    except KarboError as e:
+        log.warning("не смог кикнуть за NSFW: %s", e)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,19 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_warns_chat_user ON warns(chat_id, user_id)"
             )
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS nsfw_warns (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id    TEXT NOT NULL,
+                    user_id    TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nsfw_warns_chat_user ON nsfw_warns(chat_id, user_id)"
+            )
+
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS chat_config (
                     chat_id    TEXT PRIMARY KEY,
@@ -80,6 +93,40 @@ class Storage:
             )
             count = await cur.fetchone()
             return count[0] if count else 0
+
+    # ---- nsfw страйки ----
+    # отдельный счётчик чтобы случайный варн не сбрасывал nsfw и наоборот
+
+    async def add_nsfw_warn(self, chat_id, user_id, ts):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO nsfw_warns (chat_id, user_id, created_at) VALUES (?, ?, ?)",
+                (chat_id, user_id, ts),
+            )
+            await db.commit()
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM nsfw_warns WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def count_nsfw_warns(self, chat_id, user_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM nsfw_warns WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def clear_nsfw_warns(self, chat_id, user_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM nsfw_warns WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+            await db.commit()
 
     # ---- настройки чата ----
 
