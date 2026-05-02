@@ -200,6 +200,36 @@ async def cmd_setwarns(bot, bot_id, msg, storage, args):
     await reply(bot, msg, f"Лимит варнов для этого чата: {n}.")
 
 
+async def cmd_setnsfw(bot, bot_id, msg, storage, args):
+    if msg_role(msg) < ORG_MIN:
+        return
+    if not args:
+        await reply(bot, msg, "Использование: /setnsfw <число 1-100> | on | off")
+        return
+
+    a = args[0].lower()
+    # принимаем on/off на разных раскладках, ну а вдруг
+    if a in ("off", "disable", "выкл"):
+        await storage.set_nsfw_enabled(msg.chat_id, False)
+        await reply(bot, msg, "Авто-модерация 18+ отключена в этом чате.")
+        return
+    if a in ("on", "enable", "вкл"):
+        await storage.set_nsfw_enabled(msg.chat_id, True)
+        limit, _ = await storage.get_nsfw_config(msg.chat_id, NSFW_LIMIT)
+        await reply(bot, msg, f"Авто-модерация 18+ включена. Лимит: {limit}.")
+        return
+    if a.isdigit():
+        n = int(a)
+        if n < 1 or n > 100:
+            await reply(bot, msg, "Число должно быть от 1 до 100.")
+            return
+        await storage.set_nsfw_limit(msg.chat_id, n)
+        await reply(bot, msg, f"Лимит NSFW-страйков для этого чата: {n}. Авто-модерация включена.")
+        return
+
+    await reply(bot, msg, "Использование: /setnsfw <число 1-100> | on | off")
+
+
 async def cmd_warns(bot, bot_id, msg, storage, args):
     target_id = None
     target_name = "Пользователь"
@@ -214,7 +244,12 @@ async def cmd_warns(bot, bot_id, msg, storage, args):
     count = await storage.count_warns(msg.chat_id, target_id)
     limit = await storage.get_warn_limit(msg.chat_id)
     nsfw_count = await storage.count_nsfw_warns(msg.chat_id, target_id)
-    await reply(bot, msg, f"{target_name}: {count}/{limit} варнов, {nsfw_count}/{NSFW_LIMIT} NSFW.")
+    nsfw_limit, nsfw_enabled = await storage.get_nsfw_config(msg.chat_id, NSFW_LIMIT)
+    if nsfw_enabled:
+        nsfw_part = f"{nsfw_count}/{nsfw_limit} NSFW"
+    else:
+        nsfw_part = "NSFW-авто-модерация: выкл"
+    await reply(bot, msg, f"{target_name}: {count}/{limit} варнов, {nsfw_part}.")
 
 
 async def main():
@@ -251,6 +286,8 @@ async def main():
                         await cmd_kick(bot, bot_id, msg, storage, args)
                     elif cmd == "setwarns":
                         await cmd_setwarns(bot, bot_id, msg, storage, args)
+                    elif cmd == "setnsfw":
+                        await cmd_setnsfw(bot, bot_id, msg, storage, args)
                     elif cmd == "warns":
                         await cmd_warns(bot, bot_id, msg, storage, args)
                 except Exception as e:
@@ -269,6 +306,10 @@ async def handle_nsfw(bot, bot_id, msg, storage, nsfw):
     if not msg.images:
         return
 
+    limit, enabled = await storage.get_nsfw_config(msg.chat_id, NSFW_LIMIT)
+    if not enabled:
+        return
+
     # тут без try падало пару раз когда картинка битая. теперь ловим всё
     try:
         explicit = await nsfw.is_explicit(msg.images)
@@ -284,15 +325,15 @@ async def handle_nsfw(bot, bot_id, msg, storage, nsfw):
     name = msg_name(msg)
     count = await storage.add_nsfw_warn(msg.chat_id, msg.user_id, int(time.time()))
 
-    if count < NSFW_LIMIT:
-        await reply(bot, msg, f"{name}, 18+ контент запрещён. Предупреждение {count}/{NSFW_LIMIT}.")
+    if count < limit:
+        await reply(bot, msg, f"{name}, 18+ контент запрещён. Предупреждение {count}/{limit}.")
         return
 
     try:
         await bot.kick_user(msg.chat_id, msg.user_id)
         await storage.clear_warns(msg.chat_id, msg.user_id)
         await storage.clear_nsfw_warns(msg.chat_id, msg.user_id)
-        await reply(bot, msg, f"{name} кикнут за 18+ контент ({count}/{NSFW_LIMIT}).")
+        await reply(bot, msg, f"{name} кикнут за 18+ контент ({count}/{limit}).")
     except ForbiddenError:
         return
     except KarboError as e:
