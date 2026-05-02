@@ -20,6 +20,7 @@ logging.basicConfig(
 log = logging.getLogger("moderator")
 
 TOKEN = os.environ["KARBO_BOT_TOKEN"]
+OWNER = (os.environ.get("BOT_OWNER_ID") or "").strip()
 DB_PATH = os.environ.get("DB_PATH", "moderator.db")
 DEFAULT_LIMIT = int(os.environ.get("DEFAULT_WARN_LIMIT", "10"))
 NSFW_ON = os.environ.get("NSFW_ENABLED", "1") == "1"
@@ -28,6 +29,7 @@ NSFW_LIMIT = int(os.environ.get("NSFW_WARN_LIMIT", "3"))
 HELPER_MIN = int(os.environ.get("HELPER_ROLE_MIN", "1"))
 ORG_MIN = int(os.environ.get("ORGANIZER_ROLE_MIN", "2"))
 ROLE_TTL = float(os.environ.get("BOT_ROLE_TTL", "300"))
+PREFIX = (os.environ.get("CMD_PREFIX") or "/").strip() or "/"
 
 # кэш роли бота на 5 мин, иначе апи задрочим
 # chat_id -> (role, expires_at)
@@ -252,6 +254,36 @@ async def cmd_warns(bot, bot_id, msg, storage, args):
     await reply(bot, msg, f"{target_name}: {count}/{limit} варнов, {nsfw_part}.")
 
 
+async def cmd_leave(bot, bot_id, msg, storage, args):
+    is_owner = bool(OWNER) and msg.user_id == OWNER
+    if not (is_owner or msg_role(msg) >= ORG_MIN):
+        return
+    await reply(bot, msg, "Выхожу из чата.")
+    try:
+        await bot.leave_chat(msg.chat_id)
+        _role_cache.pop(msg.chat_id, None)  # кэш сбросить тут
+    except KarboError as e:
+        log.warning("не смог выйти: %s", e)
+
+
+HELP_TEXT = (
+    "Команды модератора (префикс {p})\n\n"
+    "{p}warn [причина] - выдать варн (reply на нарушителя). При достижении лимита - авто-кик.\n"
+    "{p}unwarn - снять последний варн (reply).\n"
+    "{p}kick [причина] - кикнуть (reply).\n"
+    "{p}warns - показать число варнов (свои или reply на юзера).\n"
+    "{p}setwarns N - установить лимит варнов в чате (только организатор).\n"
+    "{p}setnsfw N | on | off - лимит NSFW-страйков, вкл/выкл авто-18+ (организатор).\n"
+    "{p}leave - бот выходит из чата (организатор или владелец бота).\n"
+    "{p}help - эта справка.\n\n"
+    "Авто-модерация: за каждое 18+ изображение - страйк, по достижении лимита - кик."
+)
+
+
+async def cmd_help(bot, bot_id, msg, storage, args):
+    await reply(bot, msg, HELP_TEXT.format(p=PREFIX))
+
+
 async def main():
     storage = Storage(DB_PATH, DEFAULT_LIMIT)
     await storage.init()
@@ -262,20 +294,33 @@ async def main():
         ws = KarboBotWS(TOKEN)
         me = await bot.get_me()
         bot_id = me.bot_id
-        log.info("Бот онлайн: %s id=%s", me.name, bot_id)
+        log.info(
+            "Бот онлайн: name=%r id=%s status=%s owner=%s",
+            me.name, bot_id, me.status, OWNER or "<не задан>",
+        )
 
         @ws.on_message
         async def on_message(msg: Message):
             if msg.user_id == bot_id:
                 return
-            content = (msg.content or "").strip()
-            log.info("MSG %s: %r", msg.user_id, content[:80])
+            if msg.type != 0:
+                return
 
-            if content.startswith("/"):
-                parts = content[1:].split()
+            nick = msg.author.nickname if msg.author else "?"
+            role = msg.author.role if msg.author else 0
+            log.info(
+                "MSG chat=%s user=%s nick=%r role=%s: %r",
+                msg.chat_id, msg.user_id, nick, role,
+                (msg.content or "")[:80],
+            )
+
+            content = (msg.content or "").strip()
+
+            if content.startswith(PREFIX):
+                parts = content[len(PREFIX):].split()
                 if not parts:
                     return
-                cmd = parts[0].lower()
+                cmd = parts[0].lower().split("@", 1)[0]
                 args = parts[1:]
                 try:
                     if cmd == "warn":
@@ -290,6 +335,13 @@ async def main():
                         await cmd_setnsfw(bot, bot_id, msg, storage, args)
                     elif cmd == "warns":
                         await cmd_warns(bot, bot_id, msg, storage, args)
+                    elif cmd == "leave":
+                        await cmd_leave(bot, bot_id, msg, storage, args)
+                    elif cmd == "help":
+                        await cmd_help(bot, bot_id, msg, storage, args)
+                    else:
+                        # хз что это, мимо
+                        return
                 except Exception as e:
                     log.exception("ошибка в команде %s: %s", cmd, e)
                 return
