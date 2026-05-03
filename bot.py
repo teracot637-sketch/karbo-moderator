@@ -57,8 +57,8 @@ def msg_name(msg):
 
 
 async def fetch_role(bot, chat_id, user_id):
-    # тащим всех мемберов и ищем кого надо. tупо но работает
-    # 200 это максимум на запрос вроде
+    # тащим всех мемберов и ищем кого надо
+    # 200 это максимум вроде
     offset = 0
     try:
         while True:
@@ -94,7 +94,7 @@ async def reply(bot, msg, text):
 
 
 async def get_reply_target(bot, msg):
-    # тащим сообщение на которое реплай чтобы узнать кому варн
+    # берем сообщение на которое реплай чтобы узнать кому варн
     if not msg.reply_message_id:
         return None
     try:
@@ -135,8 +135,6 @@ async def get_mention_target(bot, msg, args):
     if target_value is None:
         return None, args, "no_target"
 
-    # надо вытащить мемберов и поискать. да, опять. api такое.
-    # TODO: может потом закэшить хотя бы на 30 сек, пока пофиг
     members = []
     offset = 0
     try:
@@ -161,7 +159,7 @@ async def get_mention_target(bot, msg, args):
     else:
         wanted = target_value.lower()
         for m in members:
-            # ник может быть None если юзер без ника, ну и пофиг
+            # ник может быть None если юзер без ника
             if m.nickname and m.nickname.lower() == wanted:
                 found = (m.user_id, m.nickname)
                 break
@@ -178,13 +176,13 @@ async def get_mention_target(bot, msg, args):
 # ===========================================================
 
 async def cmd_warn(bot, bot_id, msg, storage, args):
-    # бот сам должен быть помощником и автор тоже
+    # бот сам должен быть помощником и автор тоже или оргом
     if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
         return
     if msg_role(msg) < HELPER_MIN:
         return
 
-    # цель: реплай или mention
+    # реплай или mention
     if msg.reply_message_id:
         t = await get_reply_target(bot, msg)
         if not t:
@@ -217,7 +215,7 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
         await reply(bot, msg, text)
         return
 
-    # лимит - кикаем
+    # лимит = кикаем
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
@@ -260,7 +258,7 @@ async def cmd_unwarn(bot, bot_id, msg, storage, args):
 
 
 async def cmd_kick(bot, bot_id, msg, storage, args):
-    # тоже самое почти как warn только без счётчика. лень выносить общий код
+    # тоже самое почти как warn только без счётчика
     if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
         return
     if msg_role(msg) < HELPER_MIN:
@@ -384,7 +382,7 @@ async def cmd_leave(bot, bot_id, msg, storage, args):
     await reply(bot, msg, "Выхожу из чата.")
     try:
         await bot.leave_chat(msg.chat_id)
-        _role_cache.pop(msg.chat_id, None)  # кэш сбросить тут
+        _role_cache.pop(msg.chat_id, None)  # кэш сбросить
     except KarboError as e:
         log.warning("не смог выйти: %s", e)
 
@@ -432,7 +430,7 @@ async def main():
             if not msg.user_id and msg.author and msg.author.user_id:
                 msg = replace(msg, user_id=msg.author.user_id)
 
-            # себя и не-текст игнорим
+            # себя и не текст игнорим
             if msg.user_id == bot_id:
                 return
             if msg.type != 0:
@@ -474,13 +472,12 @@ async def main():
                     elif cmd == "help":
                         await cmd_help(bot, bot_id, msg, storage, args)
                     else:
-                        # хз что это, мимо
                         return
                 except Exception as e:
                     log.exception("ошибка в команде %s: %s", cmd, e)
                 return
 
-            # не команда - картинки на nsfw
+            # картинки на nsfw
             if nsfw and nsfw.ready and msg.images:
                 asyncio.create_task(handle_nsfw(bot, bot_id, msg, storage, nsfw))
 
