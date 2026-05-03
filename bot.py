@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import time
+from dataclasses import replace
 
 from dotenv import load_dotenv
 from karbo import KarboBot, KarboBotWS, Message
@@ -13,12 +15,15 @@ from storage import Storage
 
 load_dotenv()
 
+# логи
+log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, log_level_name, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("moderator")
 
+# конфиг из .env
 TOKEN = os.environ["KARBO_BOT_TOKEN"]
 OWNER = (os.environ.get("BOT_OWNER_ID") or "").strip()
 DB_PATH = os.environ.get("DB_PATH", "moderator.db")
@@ -34,6 +39,9 @@ PREFIX = (os.environ.get("CMD_PREFIX") or "/").strip() or "/"
 # кэш роли бота на 5 мин, иначе апи задрочим
 # chat_id -> (role, expires_at)
 _role_cache = {}
+
+# uuid из mention
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def msg_role(msg):
@@ -86,6 +94,7 @@ async def reply(bot, msg, text):
 
 
 async def get_reply_target(bot, msg):
+    # тащим сообщение на которое реплай чтобы узнать кому варн
     if not msg.reply_message_id:
         return None
     try:
@@ -97,24 +106,107 @@ async def get_reply_target(bot, msg):
     return target.user_id, name
 
 
+async def get_mention_target(bot, msg, args):
+    """
+    ищем в args либо uuid либо @ник.
+    возвращает (target, оставшиеся args, статус)
+    статусы: ok / no_target / not_found
+    """
+    target_idx = -1
+    target_kind = None
+    target_value = None
+
+    for i, raw in enumerate(args):
+        s = raw.strip().strip(".,:;!?()[]{}<>\"'")
+        if not s:
+            continue
+        m = UUID_RE.search(s)
+        if m:
+            target_kind = "uuid"
+            target_value = m.group(0)
+            target_idx = i
+            break
+        if s.startswith("@") and len(s) > 1:
+            target_kind = "nick"
+            target_value = s[1:]
+            target_idx = i
+            break
+
+    if target_value is None:
+        return None, args, "no_target"
+
+    # надо вытащить мемберов и поискать. да, опять. api такое.
+    # TODO: может потом закэшить хотя бы на 30 сек, пока пофиг
+    members = []
+    offset = 0
+    try:
+        while True:
+            batch = await bot.get_chat_members(msg.chat_id, limit=200, offset=offset)
+            if not batch:
+                break
+            members.extend(batch)
+            if len(batch) < 200:
+                break
+            offset += 200
+    except KarboError as e:
+        log.warning("не достал участников: %s", e)
+        return None, args, "not_found"
+
+    found = None
+    if target_kind == "uuid":
+        for m in members:
+            if m.user_id.lower() == target_value.lower():
+                found = (m.user_id, m.nickname)
+                break
+    else:
+        wanted = target_value.lower()
+        for m in members:
+            # ник может быть None если юзер без ника, ну и пофиг
+            if m.nickname and m.nickname.lower() == wanted:
+                found = (m.user_id, m.nickname)
+                break
+
+    if not found:
+        return None, args, "not_found"
+
+    rest = [a for j, a in enumerate(args) if j != target_idx]
+    return found, rest, "ok"
+
+
+# ===========================================================
+#                     команды
+# ===========================================================
+
 async def cmd_warn(bot, bot_id, msg, storage, args):
-    # бот должен быть помощником и автор тоже
+    # бот сам должен быть помощником и автор тоже
     if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
         return
     if msg_role(msg) < HELPER_MIN:
         return
 
-    t = await get_reply_target(bot, msg)
-    if not t:
-        await reply(bot, msg, "Команда /warn должна быть ответом на сообщение нарушителя.")
-        return
-    target_id, target_name = t
+    # цель: реплай или mention
+    if msg.reply_message_id:
+        t = await get_reply_target(bot, msg)
+        if not t:
+            await reply(bot, msg, "Не нашёл сообщение нарушителя.")
+            return
+        target_id, target_name = t
+        reason_args = args
+    else:
+        found, reason_args, status = await get_mention_target(bot, msg, args)
+        if not found:
+            if status == "no_target":
+                await reply(bot, msg, "Команда /warn должна быть ответом или содержать упоминание.")
+            else:
+                await reply(bot, msg, "Не нашёл такого пользователя.")
+            return
+        target_id, target_name = found
 
     if target_id == bot_id:
         await reply(bot, msg, "Себя предупредить я не дам.")
         return
 
-    reason = " ".join(args).strip()
+    reason = " ".join(reason_args).strip()
     count = await storage.add_warn(msg.chat_id, target_id, msg.user_id, reason, int(time.time()))
     limit = await storage.get_warn_limit(msg.chat_id)
 
@@ -125,42 +217,12 @@ async def cmd_warn(bot, bot_id, msg, storage, args):
         await reply(bot, msg, text)
         return
 
+    # лимит - кикаем
     try:
         await bot.kick_user(msg.chat_id, target_id)
         await storage.clear_warns(msg.chat_id, target_id)
         await storage.clear_nsfw_warns(msg.chat_id, target_id)
         await reply(bot, msg, f"{target_name} получил {count}/{limit} варнов и был кикнут.")
-    except ForbiddenError:
-        await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
-    except KarboError as e:
-        await reply(bot, msg, f"Ошибка кика: {e}")
-
-
-async def cmd_kick(bot, bot_id, msg, storage, args):
-    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
-        return
-    if msg_role(msg) < HELPER_MIN:
-        return
-
-    t = await get_reply_target(bot, msg)
-    if not t:
-        await reply(bot, msg, "Команда /kick должна быть ответом на сообщение нарушителя.")
-        return
-    target_id, target_name = t
-
-    if target_id == bot_id:
-        await reply(bot, msg, "Меня кикнуть не получится.")
-        return
-
-    reason = " ".join(args).strip()
-    try:
-        await bot.kick_user(msg.chat_id, target_id)
-        await storage.clear_warns(msg.chat_id, target_id)
-        await storage.clear_nsfw_warns(msg.chat_id, target_id)
-        text = f"{target_name} кикнут."
-        if reason:
-            text += " Причина: " + reason
-        await reply(bot, msg, text)
     except ForbiddenError:
         await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
     except KarboError as e:
@@ -173,11 +235,21 @@ async def cmd_unwarn(bot, bot_id, msg, storage, args):
     if msg_role(msg) < HELPER_MIN:
         return
 
-    t = await get_reply_target(bot, msg)
-    if not t:
-        await reply(bot, msg, "Команда /unwarn должна быть ответом на сообщение пользователя.")
-        return
-    target_id, target_name = t
+    if msg.reply_message_id:
+        t = await get_reply_target(bot, msg)
+        if not t:
+            await reply(bot, msg, "Не нашёл сообщение пользователя.")
+            return
+        target_id, target_name = t
+    else:
+        found, _rest, status = await get_mention_target(bot, msg, args)
+        if not found:
+            if status == "no_target":
+                await reply(bot, msg, "Команда /unwarn должна быть ответом или содержать упоминание.")
+            else:
+                await reply(bot, msg, "Не нашёл такого пользователя.")
+            return
+        target_id, target_name = found
 
     remaining = await storage.remove_last_warn(msg.chat_id, target_id)
     if remaining < 0:
@@ -185,6 +257,49 @@ async def cmd_unwarn(bot, bot_id, msg, storage, args):
         return
     limit = await storage.get_warn_limit(msg.chat_id)
     await reply(bot, msg, f"С {target_name} снят варн. Осталось: {remaining}/{limit}.")
+
+
+async def cmd_kick(bot, bot_id, msg, storage, args):
+    # тоже самое почти как warn только без счётчика. лень выносить общий код
+    if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
+        return
+    if msg_role(msg) < HELPER_MIN:
+        return
+
+    if msg.reply_message_id:
+        t = await get_reply_target(bot, msg)
+        if not t:
+            await reply(bot, msg, "Не нашёл сообщение нарушителя.")
+            return
+        target_id, target_name = t
+        reason_args = args
+    else:
+        found, reason_args, status = await get_mention_target(bot, msg, args)
+        if not found:
+            if status == "no_target":
+                await reply(bot, msg, "Команда /kick должна быть ответом или содержать упоминание.")
+            else:
+                await reply(bot, msg, "Не нашёл такого пользователя.")
+            return
+        target_id, target_name = found
+
+    if target_id == bot_id:
+        await reply(bot, msg, "Меня кикнуть не получится.")
+        return
+
+    reason = " ".join(reason_args).strip()
+    try:
+        await bot.kick_user(msg.chat_id, target_id)
+        await storage.clear_warns(msg.chat_id, target_id)
+        await storage.clear_nsfw_warns(msg.chat_id, target_id)
+        text = f"{target_name} кикнут."
+        if reason:
+            text += " Причина: " + reason
+        await reply(bot, msg, text)
+    except ForbiddenError:
+        await reply(bot, msg, f"Не могу кикнуть {target_name}: нет прав.")
+    except KarboError as e:
+        await reply(bot, msg, f"Ошибка кика: {e}")
 
 
 async def cmd_setwarns(bot, bot_id, msg, storage, args):
@@ -239,7 +354,15 @@ async def cmd_warns(bot, bot_id, msg, storage, args):
         t = await get_reply_target(bot, msg)
         if t:
             target_id, target_name = t
+    elif args:
+        found, _rest, status = await get_mention_target(bot, msg, args)
+        if found:
+            target_id, target_name = found
+        elif status == "not_found":
+            await reply(bot, msg, "Не нашёл такого пользователя.")
+            return
     if not target_id:
+        # ну ок, показываем свои
         target_id = msg.user_id
         target_name = msg_name(msg)
 
@@ -268,9 +391,9 @@ async def cmd_leave(bot, bot_id, msg, storage, args):
 
 HELP_TEXT = (
     "Команды модератора (префикс {p})\n\n"
-    "{p}warn [причина] - выдать варн (reply на нарушителя). При достижении лимита - авто-кик.\n"
-    "{p}unwarn - снять последний варн (reply).\n"
-    "{p}kick [причина] - кикнуть (reply).\n"
+    "{p}warn [причина] - выдать варн (reply или упоминание). При достижении лимита - авто-кик.\n"
+    "{p}unwarn - снять последний варн (reply или упоминание).\n"
+    "{p}kick [причина] - кикнуть (reply или упоминание).\n"
     "{p}warns - показать число варнов (свои или reply на юзера).\n"
     "{p}setwarns N - установить лимит варнов в чате (только организатор).\n"
     "{p}setnsfw N | on | off - лимит NSFW-страйков, вкл/выкл авто-18+ (организатор).\n"
@@ -283,6 +406,10 @@ HELP_TEXT = (
 async def cmd_help(bot, bot_id, msg, storage, args):
     await reply(bot, msg, HELP_TEXT.format(p=PREFIX))
 
+
+# =============================================================
+#                       главный цикл
+# =============================================================
 
 async def main():
     storage = Storage(DB_PATH, DEFAULT_LIMIT)
@@ -301,6 +428,11 @@ async def main():
 
         @ws.on_message
         async def on_message(msg: Message):
+            # бывает что user_id пустой а user сидит в author. подменяем
+            if not msg.user_id and msg.author and msg.author.user_id:
+                msg = replace(msg, user_id=msg.author.user_id)
+
+            # себя и не-текст игнорим
             if msg.user_id == bot_id:
                 return
             if msg.type != 0:
@@ -313,9 +445,11 @@ async def main():
                 msg.chat_id, msg.user_id, nick, role,
                 (msg.content or "")[:80],
             )
+            # print("DEBUG", msg.images)  # пригодится если nsfw сглючит
 
             content = (msg.content or "").strip()
 
+            # команды
             if content.startswith(PREFIX):
                 parts = content[len(PREFIX):].split()
                 if not parts:
@@ -371,6 +505,7 @@ async def handle_nsfw(bot, bot_id, msg, storage, nsfw):
     if not explicit:
         return
 
+    # бот должен быть помощником чтобы кикнуть
     if await get_bot_role(bot, bot_id, msg.chat_id) < HELPER_MIN:
         return
 
